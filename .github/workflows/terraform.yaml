@@ -1,83 +1,90 @@
 # ======================================================================
 # Workflow Name: Terraform Deploy (Reusable)
 # Purpose: Reusable workflow that deploys Terraform infra (Function App,
-#          EventHub, IoT Hub routing, etc.) using OIDC login and remote backend.
+#          EventHub, etc.) using OIDC login and remote backend.
 # ======================================================================
- 
+
 name: Terraform Deploy (Reusable)
- 
+
 on:
-  workflow_call:
+  workflow_call:                               # Trigger when called by another workflow
     inputs:
-      tf_root:
+      tf_root:                                 # Path to Terraform root dir
         description: "Terraform root directory"
         type: string
         required: false
         default: "infra"
-      tf_apply:
+      tf_apply:                                # Whether to run 'terraform apply'
         description: "Terraform Apply true/false"
         type: string
         required: false
         default: "true"
-      app_insights:
+      app_insights:                            # Toggle for enabling Application Insights
         description: "Enable Application Insights"
         type: string
         required: false
         default: "true"
-      language_version:
+      language_version:                        # Unused here, just for parity with build job
         description: "Language version (unused here, passed through for parity)"
         type: string
         required: false
         default: "3.10"
-      external_repo:
+      external_repo:                           # Repo to checkout (optional override)
         description: "External repository to checkout"
         type: string
         required: false
-      deploy_env:
+      deploy_env:                              # Environment to attach (controls OIDC sub claim)
         description: "Resolved deployment environment (from setup job)"
         type: string
         required: true
-      version_tag:
+      version_tag:                             # Version tag for deployment
         description: "Version tag from semantic-versioning"
         type: string
         required: false
-      # -------- NEW: allow caller to pass IoT Hub name (or set env/repo var IOTHUB_NAME) --------
-      iothub_name:
-        description: "Name of the existing IoT Hub (fallback to vars.IOTHUB_NAME)"
-        type: string
-        required: false
- 
+
 permissions:
-  id-token: write
-  contents: read
- 
+  id-token: write                              # Needed for OIDC Azure login
+  contents: read                               # Needed for checkout + artifacts
+
 env:
-  TF_WORKING_DIR: ${{ inputs.tf_root || 'infra' }}
-  TF_VERSION: "1.9.5"
- 
+  TF_WORKING_DIR: ${{ inputs.tf_root || 'infra' }}   # Default Terraform working directory
+  TF_VERSION: "1.9.5"                         # Terraform CLI version
+
 jobs:
   terraform:
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.deploy_env }}
- 
+    runs-on: ubuntu-latest                     # Use latest Ubuntu runner
+    environment: ${{ inputs.deploy_env }}      # Attach env so OIDC subject = repo:...:environment:${deploy_env}
+
     steps:
+      # ------------------------------
+      # Checkout repo (or external repo if provided)
+      # ------------------------------
       - name: Checkout (repo or external)
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.external_repo || github.repository }}
- 
+
+      # ------------------------------
+      # Download function build artifact (created in build job)
+      # ------------------------------
       - name: Download build ZIP (from same run)
         uses: actions/download-artifact@v4
         with:
           name: function-zip
- 
+
+      # ------------------------------
+      # Ensure dist folder & move zip
+      # ------------------------------
       - name: Ensure dist path
         shell: bash
         run: |
           mkdir -p dist
           [[ -f function.zip ]] && mv function.zip dist/function.zip || true
           ls -lah dist
- 
+
+      # ------------------------------
+      # Azure Login with OIDC (no secrets needed except federated credentials)
+      # ------------------------------
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -85,7 +92,10 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           allow-no-subscriptions: false
- 
+
+      # ------------------------------
+      # Export Azure creds as ARM_* so Terraform provider picks them
+      # ------------------------------
       - name: Export ARM_* for Terraform OIDC
         shell: bash
         run: |
@@ -93,12 +103,18 @@ jobs:
           echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> "$GITHUB_ENV"
           echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> "$GITHUB_ENV"
           echo "ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
- 
+
+      # ------------------------------
+      # Install Terraform CLI
+      # ------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
- 
+
+      # ------------------------------
+      # Prepare backend container (remote state in existing SA)
+      # ------------------------------
       - name: Prepare backend container (existing SA)
         id: backend
         shell: bash
@@ -108,31 +124,34 @@ jobs:
           SA="${{ vars.STATE_STORAGE }}"
           CN="${{ vars.STATE_CONTAINER }}"
           KEY="${{ vars.STATE_KEY }}"
- 
+
           echo "Using existing storage account: $SA (RG: $RG)"
           az storage account show --name "$SA" --resource-group "$RG" --only-show-errors 1>/dev/null
- 
+
           echo "Fetching access key..."
           ACCOUNT_KEY="$(az storage account keys list \
             --resource-group "$RG" \
             --account-name "$SA" \
             --query '[0].value' -o tsv)"
- 
+
           if [[ -z "$ACCOUNT_KEY" ]]; then
             echo "Failed to obtain storage account key for $SA" >&2
             exit 1
           fi
- 
+
           echo "::add-mask::$ACCOUNT_KEY"
           echo "ACCOUNT_KEY=$ACCOUNT_KEY" >> "$GITHUB_OUTPUT"
- 
+
           echo "Ensuring container '$CN' exists..."
           az storage container create \
             --name "$CN" \
             --account-name "$SA" \
             --account-key "$ACCOUNT_KEY" \
             --only-show-errors 1>/dev/null
- 
+
+      # ------------------------------
+      # Terraform Init with remote backend
+      # ------------------------------
       - name: Terraform Init
         working-directory: ${{ env.TF_WORKING_DIR }}
         shell: bash
@@ -143,20 +162,10 @@ jobs:
             -backend-config="container_name=${{ vars.STATE_CONTAINER }}" \
             -backend-config="key=${{ vars.STATE_KEY }}" \
             -backend-config="access_key=${{ steps.backend.outputs.ACCOUNT_KEY }}"
- 
-      # -------- NEW: resolve + validate IoT Hub name (caller input or env/repo var) --------
-      - name: Resolve IoT Hub inputs
-        shell: bash
-        run: |
-          IOTHUB_NAME="${{ inputs.iothub_name || vars.IOTHUB_NAME }}"
-          if [ -z "$IOTHUB_NAME" ]; then
-            echo "::error::IoT Hub name is required. Set workflow input 'iothub_name' or environment/repo variable 'IOTHUB_NAME'."
-            exit 1
-          fi
-          echo "IOTHUB_NAME=$IOTHUB_NAME" >> "$GITHUB_ENV"
-          # If IoT Hub lives in a different RG than your deployment RG, optionally set IOTHUB_RG and export TF_VAR_iothub_resource_group too.
-          # echo "IOTHUB_RG=${{ vars.IOTHUB_RESOURCE_GROUP || vars.RESOURCE_GROUP }}" >> "$GITHUB_ENV"
- 
+
+      # ------------------------------
+      # Export all required TF_VARs for modules
+      # ------------------------------
       - name: Export TF Vars
         working-directory: ${{ env.TF_WORKING_DIR }}
         shell: bash
@@ -178,23 +187,28 @@ jobs:
           echo "TF_VAR_function_service_plan_name=${{ vars.FUNCTION_SERVICE_PLAN_NAME }}" >> "$GITHUB_ENV"
           echo "TF_VAR_version_tag=${{ inputs.version_tag || format('0.0.{0}', github.run_number) }}" >> "$GITHUB_ENV"
           echo "TF_VAR_build_number=${{ github.run_number }}" >> "$GITHUB_ENV"
-          # -------- NEW: hand IoT Hub name to Terraform --------
-          echo "TF_VAR_iothub_name=${IOTHUB_NAME}" >> "$GITHUB_ENV"
-          # If using a distinct RG for IoT Hub, also export:
-          # echo "TF_VAR_iothub_resource_group=${IOTHUB_RG}" >> "$GITHUB_ENV"
- 
+
+      # ------------------------------
+      # Verify ZIP exists and is readable
+      # ------------------------------
       - name: Confirm ZIP is readable
         working-directory: ${{ env.TF_WORKING_DIR }}
         shell: bash
         run: |
           ls -lah "${{ github.workspace }}/dist"
           test -r "${{ github.workspace }}/dist/function.zip"
- 
+
+      # ------------------------------
+      # Terraform Plan (always runs)
+      # ------------------------------
       - name: Terraform Plan
         working-directory: ${{ env.TF_WORKING_DIR }}
         shell: bash
         run: terraform plan -input=false -no-color -out=tfplan
- 
+
+      # ------------------------------
+      # Terraform Apply (conditional based on input)
+      # ------------------------------
       - name: Terraform Apply
         if: ${{ inputs.tf_apply == 'true' }}
         working-directory: ${{ env.TF_WORKING_DIR }}
