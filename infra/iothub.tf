@@ -1,41 +1,11 @@
-
-# -----------------------------------------------------
-# SAS policy (Send-only) at the EH Namespace level
-# -----------------------------------------------------
-resource "azurerm_eventhub_namespace_authorization_rule" "ehns_send" {
-  name                = "iothub-send"
-  namespace_name      = data.azurerm_eventhub_namespace.eventhubs_namespace.name
-  resource_group_name = var.resource_group
-  listen              = false
-  send                = true
-  manage              = false
-}
-
-# -----------------------------------------------------
-# IoT Hub → Event Hub endpoint (keyBased using SAS)
-# -----------------------------------------------------
-resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" {
-  resource_group_name = var.resource_group
-  iothub_id           = data.azurerm_iothub.iothub.id
-  name                = "EventHubMessages"
-
-  endpoint_uri        = "sb://${data.azurerm_eventhub_namespace.eventhubs_namespace.name}.servicebus.windows.net"
-  entity_path         = azurerm_eventhub.eventhub_driver_messages.name
-
-  authentication_type = "keyBased"
-  connection_string   = azurerm_eventhub_namespace_authorization_rule.ehns_send.primary_connection_string
-}
-
-# -----------------------------------------------------
-# Route Raw device messages to the custom EH endpoint
-# -----------------------------------------------------
-resource "azurerm_iothub_route" "iothub_route_eventhub_messages_endpoint" {
+# Route DeviceMessages (Raw) to the built-in EH-compatible endpoint
+resource "azurerm_iothub_route" "to_builtin_events" {
   resource_group_name = var.resource_group
   iothub_name         = data.azurerm_iothub.iothub.name
-  name                = "SqlIngestionToEventHub2"
+  name                = "SqlIngestionToBuiltInEvents"
 
   source         = "DeviceMessages"
   condition      = "$body.MessageType = 'Raw'"
-  endpoint_names = [azurerm_iothub_endpoint_eventhub.iothub_endpoint_eventhub_messages.name]
+  endpoint_names = ["events"]   # built-in Event Hubs–compatible endpoint
   enabled        = true
 }
