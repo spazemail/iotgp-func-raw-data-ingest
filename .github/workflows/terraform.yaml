@@ -187,6 +187,8 @@ jobs:
           echo "TF_VAR_function_service_plan_name=${{ vars.FUNCTION_SERVICE_PLAN_NAME }}" >> "$GITHUB_ENV"
           echo "TF_VAR_version_tag=${{ inputs.version_tag || format('0.0.{0}', github.run_number) }}" >> "$GITHUB_ENV"
           echo "TF_VAR_build_number=${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "TF_VAR_iothub_name=${{ vars.IOTHUB_NAME }}" >> "$GITHUB_ENV"
+          echo "TF_VAR_iothub_eventhub_endpoint_name=${{ vars.IOTHUB_EVENTHUB_ENDPOINT_NAME }}" >> "$GITHUB_ENV"
 
       # ------------------------------
       # Verify ZIP exists and is readable
