@@ -1,0 +1,313 @@
+# ======================================================================
+# name: Function Build & Orchestrate Terraform
+# Purpose: Build Python Azure Function ZIP, then delegate infra deploy
+#          to the reusable Terraform workflow and wrap with ServiceNow stubs.
+# Alignment with EDP:
+#  - Supports both workflow_dispatch and workflow_call, like EDP templates
+#  - Uses OIDC (id-token) + reusable Terraform runner
+#  - Derives environment (PR preview envs vs named env)
+#  - Adds lightweight semantic version tagging
+#  - Builds Azure Function ZIP with vendored dependencies
+#  - Calls ./.github/workflows/terraform.yaml (EDP-style reuse)
+# ======================================================================
+
+name: Function Build & Orchestrate Terraform
+
+on:
+  # Manual trigger (EDP also supports controlled/manual runs)
+  workflow_dispatch:
+    inputs:
+      environment:                      # EDP: maps to Azure federated credential subject
+        description: "GitHub Environment name (must match Azure federated credential)"
+        required: true
+        default: "prd"
+      tf_apply:                         # EDP: toggle plan-only vs apply
+        description: "Run terraform apply (true/false)"
+        required: true
+        default: "true"
+      app_insights:                     # EDP: toggle creating App Insights in TF
+        description: "Enable App Insights (true/false)"
+        required: true
+        default: "true"
+      solution_path:                    # Parity option (unused for Python packaging)
+        description: "Full path to the solution file"
+        type: string
+        required: false
+      tf_root:                          # EDP: where Terraform lives (infra/)
+        description: "Terraform root directory"
+        type: string
+        required: false
+        default: "infra"
+      language_version:                 # EDP: language/runtime version
+        description: "Language version"
+        type: string
+        required: false
+        default: "3.10"
+      external_repo:                    # EDP: build from another repo if needed
+        description: "External repository to checkout"
+        type: string
+        required: false
+
+  # Reusable workflow contract (lets other workflows call this)
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment name (must match Azure federated credential)"
+        type: string
+        required: false
+        default: "prd"
+      tf_apply:
+        description: "Terraform Apply true/false"
+        type: string
+        required: false
+        default: "true"
+      app_insights:
+        description: "Enable Application Insights"
+        type: string
+        required: false
+        default: "true"
+      solution_path:
+        description: "Full path to the solution file"
+        type: string
+        required: false
+      tf_root:
+        description: "Terraform root directory"
+        type: string
+        required: false
+        default: "infra"
+      language_version:
+        description: "Language version"
+        type: string
+        required: false
+        default: "3.10"
+      external_repo:
+        description: "External repository to checkout"
+        type: string
+        required: false
+
+# Minimal permissions for OIDC and repo access — aligns with EDP guidance
+permissions:
+  id-token: write
+  contents: read
+
+# Centralized envs used across jobs
+env:
+  FUNCTION_SRC_DIR: src                                   # Function code root
+  TF_WORKING_DIR: ${{ inputs.tf_root || 'infra' }}        # Terraform working dir
+  ARTIFACT_ZIP_PATH: ./dist/function.zip                  # Output artifact path
+  PYTHON_VERSION: ${{ inputs.language_version || '3.10' }} # Python runtime (Azure Functions)
+  TF_VERSION: "1.9.5"                                     # Pinned TF version
+
+jobs:
+  # --------------------------
+  # 1) SETUP: derive deployment environment consistently
+  #    PRs => ephemeral env; others => selected environment (EDP pattern)
+  # --------------------------
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy-env: ${{ steps.set-env.outputs.deploy-env }}         # Used by SNOW
+      conditional-env: ${{ steps.set-env.outputs.deploy-env }}    # Passed to deploy
+    steps:
+      - name: Set environment variables
+        id: set-env
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            branch_slug=$(echo "${{ github.head_ref }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g')
+            echo "deploy-env=pr-$branch_slug" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy-env=${{ inputs.environment || 'prd' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # --------------------------
+  # 2) SEMVER: produce a version tag (EDP tags releases)
+  #    Simple heuristic: "feat" => minor; otherwise patch.
+  # --------------------------
+  semantic-versioning:
+    runs-on: ubuntu-latest
+    needs: setup
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    outputs:
+      VERSION_TAG: ${{ steps.set-tag.outputs.version_tag }}        # Exported to deploy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                                           # Needed to read previous tags
+
+      - name: Determine bump type (minor for "feat", patch for "patch")
+        id: bump
+        shell: bash
+        run: |
+          BUMP="none"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TITLE="${{ github.event.pull_request.title }}"
+            if [[ "$TITLE" =~ feat ]]; then BUMP="minor"; fi
+            if [[ "$TITLE" =~ patch ]]; then BUMP="patch"; fi
+            if [[ "$BUMP" == "none" ]]; then
+              echo "PR title lacks 'feat' or 'patch'; defaulting to patch."
+              BUMP="patch"
+            fi
+          else
+            BUMP="patch"
+          fi
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next version tag
+        id: set-tag
+        shell: bash
+        run: |
+          LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+          IFS='.' read -r MA MI PA <<<"$LAST"
+          MA=${MA:-0}; MI=${MI:-0}; PA=${PA:-0}
+          case "${{ steps.bump.outputs.bump }}" in
+            minor) MI=$((MI+1)); PA=0 ;;
+            patch) PA=$((PA+1)) ;;
+            *) : ;;
+          esac
+          TAG="${MA}.${MI}.${PA}"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TAG="${TAG}-pr-${{ github.event.pull_request.number }}"
+          fi
+          echo "version_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "$TAG" > version-tag.txt
+
+      - name: Upload version-tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: version-tag
+          path: version-tag.txt
+
+      - name: Create Git tag (main only)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/main')
+        shell: bash
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git tag -a "${{ steps.set-tag.outputs.version_tag }}" -m "Release ${{ steps.set-tag.outputs.version_tag }}"
+          git push origin "${{ steps.set-tag.outputs.version_tag }}"
+
+  # --------------------------
+  # 3) BUILD-ZIP: Python Azure Function packaging
+  #    Mirrors EDP's "build before infra deploy" convention.
+  # --------------------------
+  build-zip:
+    runs-on: ubuntu-latest
+    needs: [setup, semantic-versioning]
+    steps:
+      - name: Checkout (repo or external)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.external_repo || github.repository }}   # EDP: supports shared/external repos
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          # FIX: comment is outside the value; expression resolves to "3.10" by default
+          python-version: ${{ env.PYTHON_VERSION }}
+          check-latest: true
+
+      - name: Sanity check files
+        shell: bash
+        run: |
+          test -f "$FUNCTION_SRC_DIR/requirements.txt" || (echo "Missing $FUNCTION_SRC_DIR/requirements.txt" && exit 1)
+          test -f "$FUNCTION_SRC_DIR/host.json" || (echo "Missing $FUNCTION_SRC_DIR/host.json" && exit 1)
+
+      - name: Install dependencies (vendored)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r "$FUNCTION_SRC_DIR/requirements.txt" --target "$FUNCTION_SRC_DIR/.python_packages/lib/site-packages"
+
+      - name: Create ZIP
+        shell: bash
+        run: |
+          rm -rf dist && mkdir -p dist
+          cd "$FUNCTION_SRC_DIR"
+          zip -r "../${{ env.ARTIFACT_ZIP_PATH }}" . \
+            -x ".venv/*" "__pycache__/*" "*.pyc" ".vscode/*" "local.settings.json" ".git/*"
+          cd -
+
+      - name: Verify ZIP contents
+        shell: bash
+        run: |
+          ls -lah dist
+          unzip -l "${{ env.ARTIFACT_ZIP_PATH }}" | sed -n '1,200p'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: function-zip
+          path: ${{ env.ARTIFACT_ZIP_PATH }}
+
+  # --------------------------
+  # 4) DEPLOY: Delegate infra to reusable Terraform workflow
+  #    EDP centralizes terraform logic; we call our shared runner.
+  # --------------------------
+  deploy:
+    name: Terraform Deploy (Reusable)
+    needs: [setup, build-zip, semantic-versioning]
+    uses: ./.github/workflows/terraform.yaml           # Reuse centralized Terraform runner
+    secrets: inherit                                   # Inherit secrets (OIDC, SN, etc.)
+    with:
+      tf_root: ${{ inputs.tf_root || 'infra' }}        # Pass-through inputs for parity with EDP
+      tf_apply: ${{ inputs.tf_apply || 'true' }}
+      app_insights: ${{ inputs.app_insights || 'true' }}
+      language_version: ${{ inputs.language_version || '3.10' }}
+      external_repo: ${{ inputs.external_repo }}
+      deploy_env: ${{ needs.setup.outputs.conditional-env }}   # Derived env (PR or named env)
+      version_tag: ${{ needs.semantic-versioning.outputs.VERSION_TAG || format('0.0.{0}', github.run_number) }}
+
+  # --------------------------
+  # 5) SNOW: ServiceNow placeholder flow
+  #    Mimics EDP change orchestration around deploy.
+  # --------------------------
+  snow:
+    name: ServiceNow
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.deploy.result != 'skipped' && needs.deploy.result != 'cancelled' }}
+    needs:
+      - deploy
+      - setup
+    env:
+      SNOW_USERNAME: ${{ secrets.SN_DEVOPS_USER }}           # EDP: secrets stored at org/repo
+      SNOW_PASSWORD: ${{ secrets.SN_DEVOPS_PASSWORD }}
+      SNOW_BASE_URL: ${{ vars.SN_DEVOPS_URL }}               # Base URL via variables
+      SNOW_ACRONYM: ${{ vars.APP_ACRONYM }}                  # Will be overridden below if repo acronym is used
+      SNOW_ENVIRONMENT: ${{ needs.setup.outputs.deploy-env }}
+    steps:
+      - name: Get Repository Acronym
+        id: get_repo_acronym
+        shell: bash
+        run: |
+          echo "REPO_ACRONYM=$(basename "${GITHUB_REPOSITORY}" | cut -d'-' -f1)" | tee -a "$GITHUB_ENV"
+          echo "SNOW_ACRONYM=$REPO_ACRONYM" >> "$GITHUB_ENV"
+
+      - name: Get Commit/PR Message
+        id: get_message
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "snow-description=PR: ${{ github.event.pull_request.title }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "snow-description=Deployment: ${{ github.event.head_commit.message }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Change Request (placeholder)
+        if: success()
+        shell: bash
+        run: |
+          echo "Would create ServiceNow change request"
+          echo "Repo acronym: ${{ env.REPO_ACRONYM }}"
+          echo "Description: ${{ steps.get_message.outputs.snow-description }}"
+
+      - name: Resolve Change (placeholder)
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "Would close ServiceNow change: success"
+          else
+            echo "Would close ServiceNow change: incomplete"
+          fi
