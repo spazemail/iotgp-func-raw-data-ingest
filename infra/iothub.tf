@@ -1,11 +1,14 @@
+
 # --- 1) IoT Hub → Event Hub custom endpoint (Managed Identity) ---
 resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" {
   resource_group_name = var.resource_group
   iothub_id           = data.azurerm_iothub.iothub.id
-  name                = "EventHubMessages2"
+  name                = "EventHubMessages2"  # keep this exact; used by the route below
 
+  # NOTE: uri uses the NAMESPACE name; path uses the EH (entity) name
   endpoint_uri        = "sb://${data.azurerm_eventhub_namespace.eventhubs_namespace.name}.servicebus.windows.net"
-  entity_path         = data.azurerm_eventhub.eventhub_messages.name
+  entity_path         = azurerm_eventhub.eventhub_driver_messages.name
+
   authentication_type = "identityBased"
 }
 
@@ -17,7 +20,7 @@ resource "azurerm_iothub_route" "telemetry_to_custom_eventhub" {
 
   source         = "DeviceMessages"
   condition      = "$body.MessageType = 'TelemetryData'"
-  endpoint_names = [azurerm_iothub_endpoint_eventhub.iothub_endpoint_eventhub_messages.name]
+  endpoint_names = [azurerm_iothub_endpoint_eventhub.iothub_endpoint_eventhub_messages.name]  # == "EventHubMessages2"
   enabled        = true
 
   lifecycle {
