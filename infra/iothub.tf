@@ -3,7 +3,7 @@
 resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" {
   resource_group_name = var.resource_group
   iothub_id           = data.azurerm_iothub.iothub.id
-  name                = "EventHubMessages"
+  name                = "EventHubMessages2"
 
   endpoint_uri        = "sb://${azurerm_eventhub_namespace.eventhubs_namespace.name}.servicebus.windows.net"
   entity_path         = azurerm_eventhub.eventhub_messages.name
@@ -14,10 +14,10 @@ resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" 
 resource "azurerm_iothub_route" "telemetry_to_eventhub" {
   resource_group_name = var.resource_group
   iothub_name         = data.azurerm_iothub.iothub.name
-  name                = "TelemetryToEventHub"
+  name                = "SqlIngestionToBuiltInEvents"
 
   source         = "DeviceMessages"
-  condition      = "$body.MessageType = 'TelemetryData'"
-  endpoint_names = [azurerm_iothub_endpoint_eventhub.iothub_endpoint_eventhub_messages.name]
+  condition      = "$body.MessageType = 'Raw'"
+  endpoint_names = ["events"]   # built-in Event Hubs–compatible endpoint
   enabled        = true
 }
