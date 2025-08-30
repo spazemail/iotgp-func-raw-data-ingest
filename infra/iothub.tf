@@ -1,3 +1,11 @@
+# Role assignment: IoT Hub MSI can send to Event Hub namespace
+resource "azurerm_role_assignment" "iothub_role_eventhub_sender" {
+  scope                = data.azurerm_eventhub_namespace.eventhubs_namespace.id
+  role_definition_name = "Azure Event Hubs Data Sender"
+  principal_id         = azurerm_iothub.my_iothub.identity[0].principal_id
+}
+
+
 
 # --- 1) IoT Hub → Event Hub custom endpoint (Managed Identity) ---
 resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" {
