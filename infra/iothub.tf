@@ -6,7 +6,7 @@
 resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" {
   resource_group_name = var.resource_group
   iothub_id           = data.azurerm_iothub.iothub.id
-  name                = "SqlIngestionToBuiltInEvents2"
+  name                = "SqlIngestionToEvents2"
 
   # NAMESPACE in URI; Event Hub in entity_path
   endpoint_uri        = "sb://${data.azurerm_eventhub_namespace.eventhubs_namespace.name}.servicebus.windows.net"
@@ -23,7 +23,7 @@ resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" 
 resource "azurerm_iothub_route" "telemetry_to_custom_eventhub" {
   resource_group_name = var.resource_group
   iothub_name         = data.azurerm_iothub.iothub.name
-  name                = "SqlIngestionToBuiltInEvents2"
+  name                = "SqlIngestionToEvents2"
 
   source         = "DeviceMessages"
   condition      = "$body.MessageType = 'Raw'"
