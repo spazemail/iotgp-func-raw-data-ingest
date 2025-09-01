@@ -76,7 +76,6 @@ resource "azurerm_linux_function_app" "eventhub_function_app" {
   app_settings = {
     FUNCTIONS_WORKER_RUNTIME         = "python"
     FUNCTIONS_EXTENSION_VERSION      = "~4"
-    FUNCTIONS_WORKER_RUNTIME         = "python"
     OUTPUT_CONTAINER                 = "databases"
     OUTPUT_PREFIX                    = "raw"
     MAX_BATCH_SIZE                   = "2000"
