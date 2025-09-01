@@ -74,24 +74,31 @@ resource "azurerm_linux_function_app" "eventhub_function_app" {
   identity { type = "SystemAssigned" }
  
   app_settings = {
-    FUNCTIONS_WORKER_RUNTIME         = "python"
-    FUNCTIONS_EXTENSION_VERSION      = "~4"
-    OUTPUT_CONTAINER                 = "databases"
-    OUTPUT_PREFIX                    = "raw"
-    MAX_BATCH_SIZE                   = "2000"
-    PARQUET_COMPRESSION              = "SNAPPY"
-    DESTINATION_FALLBACK             = "assorted"
-    WRITE_DECODED_ONLY               = "true"
-    LOG_LEVEL                        = "INFO"
-    EVENTHUB_NAME                    = azurerm_eventhub.eventhub_driver_messages.name
-    EVENTHUB_CONSUMER_GROUP          = azurerm_eventhub_consumer_group.eventhub_driver_message_consumer_group.name
-    AzureWebJobsStorage                   = data.azurerm_storage_account.function_storage.primary_connection_string
-    APPINSIGHTS_INSTRUMENTATIONKEY        = var.app_insights_enabled == "True" ? azurerm_application_insights.application_insights[0].instrumentation_key : null
-    APPLICATIONINSIGHTS_CONNECTION_STRING = var.app_insights_enabled == "True" ? azurerm_application_insights.application_insights[0].connection_string : null
- 
-    EVENTHUB_MANAGEDIDENTITY_CONNECTION__fullyQualifiedNamespace = "${data.azurerm_eventhub_namespace.eventhubs_namespace.name}.servicebus.windows.net"
-    EVENTHUB_MANAGEDIDENTITY_CONNECTION__credential              = "managedidentity"
-  }
+  FUNCTIONS_WORKER_RUNTIME = "python"
+  FUNCTIONS_EXTENSION_VERSION = "~4"
+
+  # your existing ones...
+  OUTPUT_CONTAINER     = "databases"
+  OUTPUT_PREFIX        = "raw"
+  MAX_BATCH_SIZE       = "2000"
+  PARQUET_COMPRESSION  = "SNAPPY"
+  DESTINATION_FALLBACK = "assorted"
+  WRITE_DECODED_ONLY   = "true"
+  LOG_LEVEL            = "INFO"
+  AzureWebJobsStorage  = data.azurerm_storage_account.function_storage.primary_connection_string
+
+  # for convenience if you still reference them in code
+  EVENTHUB_NAME           = azurerm_eventhub.eventhub_driver_messages.name
+  EVENTHUB_CONSUMER_GROUP = azurerm_eventhub_consumer_group.eventhub_driver_message_consumer_group.name
+
+  # **Managed Identity connection prefix**
+  EVENTHUB_MANAGEDIDENTITY_CONNECTION__fullyQualifiedNamespace = "${data.azurerm_eventhub_namespace.eventhubs_namespace.name}.servicebus.windows.net"
+  EVENTHUB_MANAGEDIDENTITY_CONNECTION__eventHubName            = azurerm_eventhub.eventhub_driver_messages.name
+  EVENTHUB_MANAGEDIDENTITY_CONNECTION__credential              = "managedidentity"
+  # If using UAMI instead of system-assigned:
+  # EVENTHUB_MANAGEDIDENTITY_CONNECTION__clientId = azurerm_user_assigned_identity.func_uami.client_id
+}
+
  
   tags = {
     Provider  = "Innowave"
