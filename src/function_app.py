@@ -303,7 +303,6 @@ def process_single_message(message: dict) -> dict:
 @app.event_hub_message_trigger(
     arg_name="azeventhub",                                                 # Parameter name in function
     event_hub_name="%EVENTHUB_NAME%",                                      # EH name from app setting
-    connection="%EVENTHUB_CONNECTION_SETTING_NAME%",                       # Connection setting name (MI/SAS)
     consumer_group="%EVENTHUB_CONSUMER_GROUP%"                             # Consumer group from app setting
     # add cardinality="many" if you want batch input                         # (not used here)
 )
