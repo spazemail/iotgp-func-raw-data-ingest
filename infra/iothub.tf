@@ -27,7 +27,8 @@ resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" 
 
   authentication_type = "identityBased"
 
-
+  # Make sure the role assignment exists before the endpoint is created
+  depends_on = [azurerm_role_assignment.iothub_eventhub_sender]
 }
 
 # -----------------------------
