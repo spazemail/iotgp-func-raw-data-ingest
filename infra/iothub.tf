@@ -31,7 +31,7 @@ resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" 
 resource "azurerm_iothub_route" "telemetry_to_custom_eventhub" {
   resource_group_name = var.resource_group
   iothub_name         = data.azurerm_iothub.iothub.name
-  name                = "SqlIngestionToEvents2-Route"
+  name                = "SqlIngestionToEvents2"
 
   source         = "DeviceMessages"
   condition      = "$body.MessageType = 'Raw'"
