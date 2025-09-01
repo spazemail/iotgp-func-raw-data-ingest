@@ -1,4 +1,16 @@
 
+# -----------------------------
+# Role assignment (IoT Hub MI -> EH sender)
+# Scope can be the specific Event Hub *or* the namespace.
+# Prefer the *Event Hub* scope least-privilege:
+# -----------------------------
+resource "azurerm_role_assignment" "iothub_eventhub_sender" {
+  scope                = azurerm_eventhub.eventhub_driver_messages.id   # or data.azurerm_eventhub_namespace.eventhubs_namespace.id
+  role_definition_name = "Azure Event Hubs Data Sender"
+
+  # Use the IoT Hub's system-assigned identity
+  principal_id         = data.azurerm_iothub.iothub.identity[0].principal_id
+}
 
 # -----------------------------
 # IoT Hub -> Event Hub endpoint (identity-based)
