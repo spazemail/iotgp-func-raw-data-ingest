@@ -85,7 +85,6 @@ resource "azurerm_linux_function_app" "eventhub_function_app" {
     LOG_LEVEL                        = "INFO"
     EVENTHUB_NAME                    = azurerm_eventhub.eventhub_driver_messages.name
     EVENTHUB_CONSUMER_GROUP          = azurerm_eventhub_consumer_group.eventhub_driver_message_consumer_group.name
-    EVENTHUB_CONNECTION_SETTING_NAME = azurerm_eventhub_authorization_rule.function_listener.primary_connection_string
     AzureWebJobsStorage                   = data.azurerm_storage_account.function_storage.primary_connection_string
     APPINSIGHTS_INSTRUMENTATIONKEY        = var.app_insights_enabled == "True" ? azurerm_application_insights.application_insights[0].instrumentation_key : null
     APPLICATIONINSIGHTS_CONNECTION_STRING = var.app_insights_enabled == "True" ? azurerm_application_insights.application_insights[0].connection_string : null
