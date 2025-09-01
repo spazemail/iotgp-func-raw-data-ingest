@@ -1,304 +1,244 @@
-import azure.functions as func
-import logging
-import base64
-import gzip
-import io
-import re
-import json
-import os
-from datetime import datetime
-from zlib import decompress
-import pyarrow as pa
-import pyarrow.parquet as pq
-from azure.storage.blob import BlobServiceClient
+import azure.functions as func         # Azure Functions Python SDK (decorators, trigger types)
+import logging                         # Standard logging module for diagnostics
+import base64                          # For Base64 decoding of incoming payloads
+import gzip                            # For gzip decompression attempts
+import io                              # In-memory byte buffers
+import re                              # Regular expressions (sanitization, base64 cleanup)
+import json                            # JSON parsing/serialization
+import os                              # Access environment variables (app settings)
+from datetime import datetime          # Timestamps for file naming
+from zlib import decompress            # zlib decompression (raw & header variants)
+import pyarrow as pa                   # Apache Arrow in-memory data structures
+import pyarrow.parquet as pq           # Parquet writer
+from azure.storage.blob import BlobServiceClient  # Azure Blob SDK client
 
-# Single FunctionApp instance
+# Single FunctionApp instance required by the v2 programming model
 app = func.FunctionApp()
 
-# =============================================================================
-# Configuration
-# =============================================================================
-# Connection string for Blob Storage (must be set in Function App settings)
-BLOB_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")
-
-# Protects very large payloads by chunking the decoded rows into batches when writing Parquet
-MAX_BATCH_SIZE = 2000
-
-# All outputs go into this single container; "folders" are virtual via blob path naming
-TARGET_CONTAINER = os.getenv("OUTPUT_CONTAINER", "databases")
-
-# Allowed characters for safe parsing from Source field (db.table)
+# Regex to keep only safe characters when reading the "Source" (e.g., "db.table")
 _NAME_KEEP = re.compile(r'[^a-zA-Z0-9._-]')
 
+# =============================================================================
+# Env helpers (no in-code defaults)
+# =============================================================================
+def _req(name: str) -> str:
+    v = os.getenv(name)                                                   # Read env var (Function App setting)
+    if v is None or (isinstance(v, str) and v.strip() == ""):             # Fail fast if missing/blank
+        raise RuntimeError(f"Missing required app setting: {name}")
+    return v                                                               # Return the non-empty value
+
+def _req_int(name: str) -> int:
+    return int(_req(name))                                                # Same as _req but cast to int
+
+def _req_bool(name: str) -> bool:
+    return _req(name).strip().lower() in ("1", "true", "yes", "y")        # Accept several truthy strings
+
+def _opt(name: str) -> str | None:
+    v = os.getenv(name)                                                   # Optional env var
+    return v if v is not None and v.strip() != "" else None               # Normalize to None if empty
+
+# =============================================================================
+# Validate required settings up-front (fail fast)
+# =============================================================================
+# Storage
+_ = _req("AzureWebJobsStorage")                                           # Must exist; also used by Blob SDK
+_ = _req("OUTPUT_CONTAINER")                                              # Target container name (required)
+
+# Behavior toggles / parameters
+MAX_BATCH_SIZE        = _req_int("MAX_BATCH_SIZE")                        # Max rows per Parquet chunk
+PARQUET_COMPRESSION   = _req("PARQUET_COMPRESSION")                       # Parquet compression (e.g., SNAPPY)
+DESTINATION_FALLBACK  = _req("DESTINATION_FALLBACK")                      # Folder when 'Destination' missing
+WRITE_DECODED_ONLY    = _req_bool("WRITE_DECODED_ONLY")                   # Toggle (kept for future use)
+LOG_LEVEL             = _req("LOG_LEVEL").upper()                         # Logging level (INFO/DEBUG/etc.)
+
+# Optional prefix path inside container (virtual subfolders)
+OUTPUT_PREFIX         = _opt("OUTPUT_PREFIX")
+
+# Apply log level globally for the Function App
+logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 # =============================================================================
 # Storage helpers
 # =============================================================================
 def initialize_blob_client() -> BlobServiceClient:
-    """
-    Initialize BlobServiceClient using the configured connection string.
-    Raises on failure so the function ends clearly if storage is unreachable.
-    """
-    # FIX: fail fast if missing connection string
-    if not BLOB_CONNECTION_STRING:
-        raise RuntimeError("AzureWebJobsStorage is not configured")
     try:
-        return BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
+        return BlobServiceClient.from_connection_string(_req("AzureWebJobsStorage"))  # Create Blob client
     except Exception as e:
-        logging.error(f"Blob storage initialization failed: {e}")
+        logging.error(f"Blob storage initialization failed: {e}")        # Log and bubble up
         raise
-
 
 def ensure_target_container(blob_service_client: BlobServiceClient):
-    """
-    Ensure the target container exists (create if not).
-    NOTE: Azure Blob "folders" are virtual; we do NOT create folders explicitly.
-    """
     try:
-        container_client = blob_service_client.get_container_client(TARGET_CONTAINER)
-        if not container_client.exists():
+        container_client = blob_service_client.get_container_client(_req("OUTPUT_CONTAINER"))  # Get container client
+        if not container_client.exists():                                   # Create if it doesn't exist
             container_client.create_container()
-            logging.info(f"Created container: {TARGET_CONTAINER}")
-        return container_client
+            logging.info(f"Created container: {_req('OUTPUT_CONTAINER')}")
+        return container_client                                             # Return for possible further use
     except Exception as e:
-        logging.error(f"Failed to ensure container {TARGET_CONTAINER}: {e}")
+        logging.error(f"Failed to ensure container {_req('OUTPUT_CONTAINER')}: {e}")  # Log error
         raise
 
+def _join_path(*parts: str) -> str:
+    clean = [p.strip("/ ") for p in parts if p and p.strip("/ ")]          # Trim slashes/spaces and drop empties
+    return "/".join(clean)                                                 # Join as virtual path (blob prefix)
 
 # =============================================================================
 # Name sanitization
 # =============================================================================
 def _sanitize_folder(name: str) -> str:
-    """
-    Sanitize a folder (top-level path segment) name:
-      - lowercase
-      - keep only [a-z0-9_-]
-      - replace everything else with underscore
-    """
-    return re.sub(r'[^a-z0-9_-]+', '_', (name or '').strip().lower())
-
+    return re.sub(r'[^a-z0-9_-]+', '_', (name or '').strip().lower())     # Lowercase + allow only a-z0-9_-
 
 def _sanitize_table(name: str) -> str:
-    """
-    Sanitize a table/file-stem name with the same rules as folder.
-    """
-    return re.sub(r'[^a-z0-9_-]+', '_', (name or '').strip().lower())
-
+    return re.sub(r'[^a-z0-9_-]+', '_', (name or '').strip().lower())     # Same rule for table/file stem
 
 # =============================================================================
-# Folder / table resolution
+# Folder / table resolution (no defaults here; uses env var for fallback)
 # =============================================================================
 def resolve_folder_and_table(message: dict) -> tuple[str, str, str]:
-    """
-    Decide the output routing and naming from an input message.
+    source = str(message.get("Source", "")).strip()                        # Read raw 'Source' from message
+    source = _NAME_KEEP.sub("", source)                                    # Keep only safe chars (db.table)
 
-    Folder (first virtual folder under the container):
-      1) If 'Destination' is present and non-empty → use Destination
-      2) Else → use literal folder name 'assorted' (NO fallback to DB)
-
-    Table:
-      - Parse from 'Source' as the substring after the first dot
-      - If 'Source' has no dot, use the whole 'Source'
-      - If absent/empty, use 'unknown_table'
-
-    Also parse source_db (for metadata only):
-      - DB part of 'Source' (substring before the first dot)
-      - If no dot, it equals the whole 'Source'
-      - If absent/empty, use 'unknown_db'
-    """
-    # Clean raw 'Source' so we only keep safe characters
-    source = str(message.get("Source", "")).strip()
-    source = _NAME_KEEP.sub("", source)
-
-    # Split Source into db and table parts (db.table); if no dot, both become Source
-    if '.' in source:
-        db_part, table_part = source.split('.', 1)
+    if '.' in source:                                                      # If "db.table" pattern
+        db_part, table_part = source.split('.', 1)                         # Split into db and table
     else:
-        db_part, table_part = source, source
+        db_part, table_part = source, source                               # No dot → both equal to source
 
-    # Folder selection rule: Destination > 'assorted'
-    raw_destination = str(message.get("Destination") or "").strip()
-    folder_source = raw_destination if raw_destination else "assorted"
+    raw_destination = str(message.get("Destination") or "").strip()        # Preferred folder if present
+    folder_source = raw_destination if raw_destination else DESTINATION_FALLBACK  # Else fallback from env
 
-    # Final sanitized parts
-    folder     = _sanitize_folder(folder_source or "assorted")
-    source_db  = _sanitize_folder(db_part or "unknown_db")
-    table_name = _sanitize_table(table_part or "unknown_table")
+    folder     = _sanitize_folder(folder_source or DESTINATION_FALLBACK)   # Sanitize folder for path
+    source_db  = _sanitize_folder(db_part or "unknown_db")                 # Sanitize db name (metadata only)
+    table_name = _sanitize_table(table_part or "unknown_table")            # Sanitize table/file stem
 
-    return folder, source_db, table_name
-
+    return folder, source_db, table_name                                   # Return routing tuple
 
 # =============================================================================
 # Decode / Decompress helpers
 # =============================================================================
 def clean_base64(data: str) -> str:
-    """
-    Remove invalid characters and pad base64 string to a multiple of 4.
-    Safe for both padded and unpadded inputs.
-    """
     try:
-        cleaned = re.sub(r'[^A-Za-z0-9+/=]', '', data or "")
-        pad_len = len(cleaned) % 4
-        if pad_len:
+        cleaned = re.sub(r'[^A-Za-z0-9+/=]', '', data or "")               # Strip illegal chars for base64
+        pad_len = len(cleaned) % 4                                         # Compute padding requirement
+        if pad_len:                                                        # Pad to multiple of 4 if needed
             cleaned += '=' * (4 - pad_len)
-        return cleaned
+        return cleaned                                                     # Return normalized base64
     except Exception as e:
-        logging.error(f"Base64 cleaning failed: {e}")
+        logging.error(f"Base64 cleaning failed: {e}")                      # Log error; return original
         return data or ""
 
-
 def try_decompress(data: bytes) -> bytes:
-    """
-    Attempt gzip, then zlib (raw), then zlib (with header); if all fail, return original bytes.
-    This allows flexible handling of various producer compression schemes.
-    """
+    # Attempt known compression schemes in order; return first that works
     methods = [
-        ("gzip", lambda: gzip.decompress(data)),
-        ("zlib (raw)", lambda: decompress(data, -15)),
-        ("zlib (with header)", lambda: decompress(data)),
-        ("no compression", lambda: data),
+        ("gzip", lambda: gzip.decompress(data)),                           # Try gzip container
+        ("zlib (raw)", lambda: decompress(data, -15)),                     # Try raw deflate
+        ("zlib (with header)", lambda: decompress(data)),                  # Try zlib w/ header
+        ("no compression", lambda: data),                                  # Fallback: assume uncompressed
     ]
     for name, method in methods:
         try:
-            out = method()
-            logging.info(f"Success with {name} decompression")
-            return out
+            out = method()                                                 # Attempt method
+            logging.info(f"Success with {name} decompression")             # Log which one worked
+            return out                                                     # Return decompressed bytes
         except Exception as e:
-            logging.warning(f"Decompression failed with {name}: {str(e)[:120]}")
-    return data
-
+            logging.debug(f"Decompression failed with {name}: {str(e)[:120]}")  # Debug failure and continue
+    return data                                                             # If all fail, return original bytes
 
 # =============================================================================
-# Shape helpers (row-wise ↔ columnar)
+# Shape helpers
 # =============================================================================
 def _is_columnar_dict(obj) -> bool:
-    """
-    True if obj is a dict where each value is a list and all lists have equal length (or all empty).
-      Example: {"colA": ["a","b"], "colB": ["1","2"]}
-    """
-    if not isinstance(obj, dict) or not obj:
+    if not isinstance(obj, dict) or not obj:                               # Must be a non-empty dict
         return False
-    lengths = set()
+    lengths = set()                                                        # Track list lengths per column
     for v in obj.values():
-        if not isinstance(v, list):
+        if not isinstance(v, list):                                        # All values must be lists
             return False
-        lengths.add(len(v))
-        if len(lengths) > 1 and 0 not in lengths:
+        lengths.add(len(v))                                                # Record list length
+        if len(lengths) > 1 and 0 not in lengths:                          # Mixed nonzero lengths → invalid
             return False
-    return True
-
+    return True                                                            # Valid columnar dict (equal lengths)
 
 def _normalize_columnar(col_dict: dict) -> dict:
-    """
-    Normalize a columnar dict so every list element is a string or None.
-    - dict/list values are JSON-encoded strings
-    - datetime-like values use isoformat()
-    """
     out = {}
-    for k, vals in col_dict.items():
+    for k, vals in col_dict.items():                                       # For each column
         norm = []
-        for v in vals:
+        for v in vals:                                                     # Normalize each cell to string/None
             if isinstance(v, (dict, list)):
-                norm.append(json.dumps(v, ensure_ascii=False))
+                norm.append(json.dumps(v, ensure_ascii=False))             # JSON encode complex types
             elif hasattr(v, "isoformat"):
-                norm.append(v.isoformat())
+                norm.append(v.isoformat())                                 # Datetime-like to ISO string
             elif v is None:
-                norm.append(None)
+                norm.append(None)                                          # Preserve nulls
             else:
-                norm.append(str(v))
-        out[k] = norm
+                norm.append(str(v))                                        # Force to string
+        out[k] = norm                                                      # Save normalized column
     return out
 
-
 def _merge_columnars(dicts: list[dict]) -> dict:
-    """
-    Concatenate multiple columnar dicts into one.
-    Keys are the union; missing keys are padded with None.
-    """
     if not dicts:
-        return {}
+        return {}                                                          # Nothing to merge
     keys = set()
     for d in dicts:
-        keys.update(d.keys())
-    lengths = [next((len(v) for v in d.values()), 0) for d in dicts]
-    merged = {k: [] for k in keys}
-    for d, dl in zip(dicts, lengths):
+        keys.update(d.keys())                                              # Union of all columns
+    lengths = [next((len(v) for v in d.values()), 0) for d in dicts]       # Row counts per fragment
+    merged = {k: [] for k in keys}                                         # Prepare merged columns
+    for d, dl in zip(dicts, lengths):                                      # For each fragment and its length
         for k in keys:
             if k in d:
-                merged[k].extend(d[k])
+                merged[k].extend(d[k])                                     # Append actual values
             else:
-                merged[k].extend([None] * dl)
+                merged[k].extend([None] * dl)                              # Pad missing columns with nulls
     return merged
 
-
 def _flatten_decoded_rows(decoded):
-    """
-    Convert decoded payload into list of row dicts (row-wise JSON).
-    - list[dict] → list[dict]
-    - dict → [dict]
-    - otherwise → []
-    """
     if isinstance(decoded, list):
-        return [r for r in decoded if isinstance(r, dict)]
+        return [r for r in decoded if isinstance(r, dict)]                 # Keep only dict rows
     if isinstance(decoded, dict):
-        return [decoded]
-    return []
-
+        return [decoded]                                                   # Single dict becomes one row
+    return []                                                              # Otherwise no rows
 
 def _rows_to_columnar(rows: list[dict]) -> dict:
-    """
-    Convert a list of row dicts into a columnar dict: {col: [values...]}.
-    Preserves first-seen key order across rows.
-    """
     if not rows:
-        return {}
-    seen = []
+        return {}                                                          # No rows → empty
+    seen = []                                                              # Maintain first-seen column order
     for r in rows:
         for k in r.keys():
             if k not in seen:
-                seen.append(k)
-    out = {k: [] for k in seen}
+                seen.append(k)                                             # Record new column name
+    out = {k: [] for k in seen}                                            # Initialize columns
     for r in rows:
-        for k in seen:
-            v = r.get(k, None)
+        for k in seen:                                                     # Preserve column order across rows
+            v = r.get(k, None)                                             # Missing keys → None
             if isinstance(v, (dict, list)):
-                out[k].append(json.dumps(v, ensure_ascii=False))
+                out[k].append(json.dumps(v, ensure_ascii=False))           # JSON encode complex values
             elif hasattr(v, "isoformat"):
-                out[k].append(v.isoformat())
+                out[k].append(v.isoformat())                               # Datetime-like to ISO string
             elif v is None:
-                out[k].append(None)
+                out[k].append(None)                                        # Pass through None
             else:
-                out[k].append(str(v))
+                out[k].append(str(v))                                      # Force to string
     return out
-
 
 # =============================================================================
 # Writers
 # =============================================================================
 def _upload_bytes(blob_service_client: BlobServiceClient, blob_path: str, data: bytes) -> str:
-    """
-    Upload raw bytes to '<container>/<blob_path>'.
-    'blob_path' may include virtual folders, e.g. 'folder/filename.ext'
-    """
-    blob_client = blob_service_client.get_blob_client(container=TARGET_CONTAINER, blob=blob_path)
-    blob_client.upload_blob(data, overwrite=True)
-    logging.info(f"Wrote: {TARGET_CONTAINER}/{blob_path}")
-    return blob_client.url
-
+    blob_client = blob_service_client.get_blob_client(                     # Get a blob client for path
+        container=_req("OUTPUT_CONTAINER"),
+        blob=blob_path
+    )
+    blob_client.upload_blob(data, overwrite=True)                          # Upload bytes; overwrite enabled
+    logging.info(f"Wrote: {_req('OUTPUT_CONTAINER')}/{blob_path}")         # Log the final blob path
+    return blob_client.url                                                 # Return blob URL (useful for tracing)
 
 def _columnar_to_single_row_table(columnar_dict: dict) -> pa.Table:
-    """
-    Create a single-row Arrow table where each column is LIST<STRING>.
-    This keeps potentially huge lists compact in one row.
-    """
-    arrays, fields = [], []
+    arrays, fields = [], []                                                # Accumulate Arrow arrays & fields
     for col_name, values in columnar_dict.items():
-        str_values = [str(v) if v is not None else None for v in values]
-        fields.append(pa.field(col_name, pa.list_(pa.string())))
-        arrays.append(pa.array([str_values], type=pa.list_(pa.string())))
-    schema = pa.schema(fields)
-    return pa.Table.from_arrays(arrays, schema=schema)
-
+        str_values = [str(v) if v is not None else None for v in values]   # Ensure values are strings/None
+        fields.append(pa.field(col_name, pa.list_(pa.string())))           # Column type: LIST<STRING>
+        arrays.append(pa.array([str_values], type=pa.list_(pa.string())))  # Single row with list cell
+    schema = pa.schema(fields)                                             # Build schema from fields
+    return pa.Table.from_arrays(arrays, schema=schema)                     # Create Arrow table
 
 def _write_parquet_under_folder(
     bsc: BlobServiceClient,
@@ -307,176 +247,149 @@ def _write_parquet_under_folder(
     columnar_dict: dict,
     meta: dict | None = None
 ) -> str:
-    """
-    Serialize a columnar dict to Parquet and upload under 'folder/filename'.
-    Adds optional schema metadata (e.g., row_count, table, etc.).
-    """
-    arrow_table = _columnar_to_single_row_table(columnar_dict)
+    arrow_table = _columnar_to_single_row_table(columnar_dict)             # Convert dict → Arrow table
     if meta:
-        arrow_table = arrow_table.replace_schema_metadata({k: str(v) for k, v in meta.items()})
-    buf = io.BytesIO()
-    pq.write_table(arrow_table, buf, compression="SNAPPY")
-    buf.seek(0)
+        arrow_table = arrow_table.replace_schema_metadata(                 # Attach small metadata to schema
+            {k: str(v) for k, v in meta.items()}
+        )
+    buf = io.BytesIO()                                                     # In-memory bytes buffer
+    pq.write_table(arrow_table, buf, compression=PARQUET_COMPRESSION)      # Write Parquet to buffer
+    buf.seek(0)                                                            # Rewind to start for upload
     try:
-        return _upload_bytes(bsc, f"{folder}/{filename}", buf.read())
+        base_path = _join_path(OUTPUT_PREFIX or "", folder)                # Combine optional prefix + folder
+        return _upload_bytes(bsc, f"{base_path}/{filename}", buf.read())   # Upload and return URL
     finally:
-        buf.close()
-
+        buf.close()                                                        # Always release buffer
 
 # =============================================================================
 # Message processing
 # =============================================================================
 def process_single_message(message: dict) -> dict:
-    """
-    Decode + decompress one message's 'Data' (if present) and detect its shape.
-
-    Returns a record containing:
-      - Original (full original message)
-      - DecodedData (dict | list | None)
-      - DecodedShape ("columnar" | "rows" | None)
-    """
     result = {
-        "Original": message,
-        "DecodedData": None,
-        "DecodedShape": None,
+        "Original": message,                                               # Preserve original message
+        "DecodedData": None,                                               # Placeholder for decoded JSON
+        "DecodedShape": None,                                              # "rows" or "columnar"
     }
-    if "Data" not in message:
+    if "Data" not in message:                                              # If no payload, return as-is
         return result
 
     try:
-        cleaned = clean_base64(str(message["Data"]))
-        decoded_bytes = base64.b64decode(cleaned)
-        decompressed = try_decompress(decoded_bytes)
+        cleaned = clean_base64(str(message["Data"]))                       # Normalize base64 string
+        decoded_bytes = base64.b64decode(cleaned)                          # Decode base64 → bytes
+        decompressed = try_decompress(decoded_bytes)                       # Try to decompress if needed
 
         try:
-            decoded_json = json.loads(decompressed.decode("utf-8"))
-            result["DecodedData"] = decoded_json
+            decoded_json = json.loads(decompressed.decode("utf-8"))        # Parse bytes → JSON
+            result["DecodedData"] = decoded_json                           # Store decoded JSON
             if isinstance(decoded_json, dict) and _is_columnar_dict(decoded_json):
-                result["DecodedShape"] = "columnar"
+                result["DecodedShape"] = "columnar"                        # Dict of equal-length lists
             elif isinstance(decoded_json, list):
-                result["DecodedShape"] = "rows"
+                result["DecodedShape"] = "rows"                            # List of row dicts
             else:
-                # Single dict treated as one row
-                result["DecodedShape"] = "rows"
+                result["DecodedShape"] = "rows"                            # Single dict → one row
         except Exception:
-            # Not JSON → ignore (we only persist JSON payloads)
-            result["DecodedData"] = None
+            result["DecodedData"] = None                                   # Not JSON → ignore payload
             result["DecodedShape"] = None
 
     except Exception as e:
-        logging.error(f"Data processing failed: {e}")
+        logging.error(f"Data processing failed: {e}")                      # Log failure (base64/decompress)
 
-    return result
-
+    return result                                                          # Return processing outcome
 
 # =============================================================================
-# Event Hub Trigger
+# Event Hub Trigger (all values come from app settings via binding expressions)
 # =============================================================================
-@app.function_name("EventHubIngest")
+@app.function_name("EventHubIngest")                                       # Name of the Function
 @app.event_hub_message_trigger(
-    arg_name="azeventhub",
-    event_hub_name="iotgp-prd-eventhub-smartqos-01-we",  # ensure this matches your EH name
-    connection="EVENTHUB_MANAGEDIDENTITY_CONNECTION",      # app setting name
-    consumer_group="function-consumer"                     # FIX: added missing comma above
-    # NOTE: if you want batch input, add: cardinality="many"
+    arg_name="azeventhub",                                                 # Parameter name in function
+    event_hub_name="%EVENTHUB_NAME%",                                      # EH name from app setting
+    connection="%EVENTHUB_CONNECTION_SETTING_NAME%",                       # Connection setting name (MI/SAS)
+    consumer_group="%EVENTHUB_CONSUMER_GROUP%"                             # Consumer group from app setting
+    # add cardinality="many" if you want batch input                         # (not used here)
 )
 def eventhub_trigger(azeventhub: func.EventHubEvent):
     """
     Main Event Hub trigger.
-
-    For each (folder, table) group, writes ONLY the decoded Parquet artifact:
-      - <TABLENAME>_<YYYYMMDDHHMMSS>[_partNNNN].parquet
-
-    Folder selection summary:
-      - Use message['Destination'] if provided and non-empty
-      - Otherwise write to literal folder 'assorted'
+    Writes ONLY the decoded Parquet artifact per (folder, table) group.
     """
     try:
-        bsc = initialize_blob_client()
-        ensure_target_container(bsc)
+        bsc = initialize_blob_client()                                     # Build Blob client from env
+        ensure_target_container(bsc)                                       # Ensure container exists
 
-        # Read the Event Hub batch body
-        message_body = azeventhub.get_body().decode("utf-8")
-        logging.info(f"Received message batch (size: {len(message_body)} bytes)")
+        message_body = azeventhub.get_body().decode("utf-8")               # Read raw body from EH event
+        logging.info(f"Received message batch (size: {len(message_body)} bytes)")  # Log size for trace
 
-        # Accept either JSON array/object or raw text (wrap raw text into {"Data": ...})
         try:
-            message_data = json.loads(message_body)
+            message_data = json.loads(message_body)                         # Try JSON parse (array or object)
         except json.JSONDecodeError:
-            message_data = {"Data": message_body}
+            message_data = {"Data": message_body}                           # Fallback: treat raw as Data string
 
-        messages = message_data if isinstance(message_data, list) else [message_data]
+        messages = message_data if isinstance(message_data, list) else [message_data]  # Normalize to list
 
-        # Decode/decompress each message; shape detection happens inside
         processed = []
         for msg in messages:
             try:
-                processed.append(process_single_message(msg))
+                processed.append(process_single_message(msg))               # Decode/decompress each message
             except Exception as e:
-                logging.error(f"Failed to process message: {e}")
+                logging.error(f"Failed to process message: {e}")            # Log and continue next
 
-        # Group by (folder, source_db, table) derived from the ORIGINAL message
-        grouped: dict[tuple[str, str, str], list[dict]] = {}
+        grouped: dict[tuple[str, str, str], list[dict]] = {}                # Key: (folder, source_db, table)
         for item in processed:
-            folder, source_db, table = resolve_folder_and_table(item.get("Original", {}))
-            if not folder or not table:
+            folder, source_db, table = resolve_folder_and_table(item.get("Original", {}))  # Routing
+            if not folder or not table:                                     # Skip if routing invalid
                 logging.warning(f"Skipping due to invalid routing: {item.get('Original')}")
                 continue
-            grouped.setdefault((folder, source_db, table), []).append(item)
+            grouped.setdefault((folder, source_db, table), []).append(item) # Group items by route
 
-        # Per group → write ONLY the decoded Parquet
-        for (folder, source_db, table), group_items in grouped.items():
+        for (folder, source_db, table), group_items in grouped.items():     # Handle each group independently
             try:
-                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")             # Timestamp for file naming
 
-                # Gather decoded payloads across messages
-                decoded_rows_all = []
-                columnar_payloads = []
+                decoded_rows_all = []                                       # Accumulate row-wise payloads
+                columnar_payloads = []                                      # Accumulate columnar payloads
 
                 for it in group_items:
-                    dd = it.get("DecodedData")
-                    shape = it.get("DecodedShape")
-                    if dd is None or shape is None:
+                    dd = it.get("DecodedData")                              # Decoded JSON (dict/list/None)
+                    shape = it.get("DecodedShape")                          # "rows", "columnar", or None
+                    if dd is None or shape is None:                         # Skip if no usable payload
                         continue
                     if shape == "columnar" and isinstance(dd, dict):
-                        columnar_payloads.append(_normalize_columnar(dd))
+                        columnar_payloads.append(_normalize_columnar(dd))   # Normalize and store columnar
                     else:
-                        decoded_rows_all.extend(_flatten_decoded_rows(dd))
+                        decoded_rows_all.extend(_flatten_decoded_rows(dd))  # Flatten rows and append
 
-                # Build final columnar dict for decoded Parquet
-                col_from_rows = _rows_to_columnar(decoded_rows_all) if decoded_rows_all else {}
-                col_merged_payloads = (
+                col_from_rows = _rows_to_columnar(decoded_rows_all) if decoded_rows_all else {}  # Rows→columns
+                col_merged_payloads = (                                     # Merge multiple columnar fragments
                     _merge_columnars(columnar_payloads) if len(columnar_payloads) > 1
                     else (columnar_payloads[0] if columnar_payloads else {})
                 )
 
-                final_parts = []
+                final_parts = []                                            # Pieces to combine
                 if col_from_rows:
-                    final_parts.append(col_from_rows)
+                    final_parts.append(col_from_rows)                       # Add rows-converted columns
                 if col_merged_payloads:
-                    final_parts.append(col_merged_payloads)
+                    final_parts.append(col_merged_payloads)                 # Add columnar merges
 
-                if not final_parts:
+                if not final_parts:                                         # If nothing to write → skip
                     logging.info(f"No decoded JSON data for {folder}/{table}; decoded parquet skipped.")
                     continue
 
-                final_columnar = _merge_columnars(final_parts) if len(final_parts) > 1 else final_parts[0]
+                final_columnar = _merge_columnars(final_parts) if len(final_parts) > 1 else final_parts[0]  # Final table
 
-                # Chunk Parquet by MAX_BATCH_SIZE to protect against huge list-cells
-                rows_count = next((len(v) for v in final_columnar.values()), 0)
-                if rows_count > MAX_BATCH_SIZE:
+                rows_count = next((len(v) for v in final_columnar.values()), 0)  # Infer row count from any column
+                base_name = f"{table}_{ts}"                                 # Base filename (table + timestamp)
+
+                if rows_count > MAX_BATCH_SIZE:                             # Chunk very large payloads
                     start = 0
                     batch_index = 0
                     while start < rows_count:
-                        end = min(start + MAX_BATCH_SIZE, rows_count)
-                        sliced = {k: v[start:end] for k, v in final_columnar.items()}
-
-                        # FIX: unique name per chunk to avoid overwrite
-                        parquet_name = f"{table}_{ts}_part{batch_index:04d}.parquet"
-                        _write_parquet_under_folder(
+                        end = min(start + MAX_BATCH_SIZE, rows_count)       # Compute window end
+                        sliced = {k: v[start:end] for k, v in final_columnar.items()}  # Slice each column
+                        parquet_name = f"{base_name}_part{batch_index:04d}.parquet"   # Chunked file name
+                        _write_parquet_under_folder(                        # Write chunk to blob
                             bsc, folder, parquet_name, sliced,
                             meta={
-                                "kind": "decoded_payload",
+                                "kind": "decoded_payload",                  # Small metadata in schema
                                 "row_count": end - start,
                                 "batch_number": batch_index,
                                 "folder": folder,
@@ -484,11 +397,11 @@ def eventhub_trigger(azeventhub: func.EventHubEvent):
                                 "table": table,
                             },
                         )
-                        batch_index += 1
-                        start = end
+                        batch_index += 1                                    # Next chunk index
+                        start = end                                         # Advance window
                 else:
-                    parquet_name = f"{table}_{ts}.parquet"
-                    _write_parquet_under_folder(
+                    parquet_name = f"{base_name}.parquet"                   # Single-file case
+                    _write_parquet_under_folder(                            # Write entire payload
                         bsc, folder, parquet_name, final_columnar,
                         meta={
                             "kind": "decoded_payload",
@@ -501,10 +414,10 @@ def eventhub_trigger(azeventhub: func.EventHubEvent):
                     )
 
             except Exception as e:
-                logging.error(f"Failed to write group {folder}/{table}: {e}")
+                logging.error(f"Failed to write group {folder}/{table}: {e}")   # Log group-level failure
 
-        logging.info("Processing complete (emitted decoded parquet per group only).")
+        logging.info("Processing complete (emitted decoded parquet per group only).")  # End-of-run info
 
     except Exception as e:
-        logging.error(f"Critical processing failure: {e}")
-        raise
+        logging.error(f"Critical processing failure: {e}")                  # Catch-all for trigger scope
+        raise                                                               # Re-raise so platform can handle
