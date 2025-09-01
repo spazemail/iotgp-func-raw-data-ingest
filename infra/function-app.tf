@@ -79,7 +79,6 @@ resource "azurerm_linux_function_app" "eventhub_function_app" {
 
   # your existing ones...
   OUTPUT_CONTAINER     = "databases"
-  OUTPUT_PREFIX        = "raw"
   MAX_BATCH_SIZE       = "2000"
   PARQUET_COMPRESSION  = "SNAPPY"
   DESTINATION_FALLBACK = "assorted"
