@@ -1,21 +1,3 @@
-# -----------------------------
-# Config
-# -----------------------------
-locals {
-  endpoint_name = "SqlIngestionToEventHub2"
-}
-
-# -----------------------------
-# RBAC: IoT Hub MI -> Event Hubs (Sender)
-# Tip: Grant at the NAMESPACE scope to cover all hubs
-# -----------------------------
-resource "azurerm_role_assignment" "iothub_eventhub_sender" {
-  scope                = data.azurerm_eventhub_namespace.eventhubs_namespace.id
-  role_definition_name = "Azure Event Hubs Data Sender"
-
-  # IoT Hub's system-assigned identity principal id
-  principal_id         = data.azurerm_iothub.iothub.identity[0].principal_id
-}
 
 # -----------------------------
 # IoT Hub -> Event Hub endpoint (identity-based)
