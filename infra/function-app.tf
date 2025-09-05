@@ -54,7 +54,7 @@ resource "azurerm_service_plan" "function_service_plan" {
 # 3. Linux Function App (Python)
 ###############################
 resource "azurerm_linux_function_app" "eventhub_function_app" {
-  name                       = "${var.app_acronym}-${var.environment}-func-${var.function_name}-${var.seq_number}-${var.location_acronym}-01"
+  name                       = "${var.app_acronym}-${var.environment}-func-${var.function_name}-${var.seq_number}-${var.location_acronym}-02"
   location                   = var.location
   resource_group_name        = var.resource_group
  
