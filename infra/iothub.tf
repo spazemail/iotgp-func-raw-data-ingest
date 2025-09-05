@@ -1,32 +1,49 @@
-
-
+ 
 # ---------------------------------------------
+
 # IoT Hub -> Event Hub endpoint (Managed Identity)
+
 # ---------------------------------------------
+
 resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" {
+
   resource_group_name = var.resource_group
+
   iothub_id           = data.azurerm_iothub.iothub.id
-  name                = "SqlIngestionToEvents2"
 
+  name                = "SqlIngestionToEvents"
+ 
   endpoint_uri        = "sb://${data.azurerm_eventhub_namespace.eventhubs_namespace.name}.servicebus.windows.net"
+
   entity_path         = azurerm_eventhub.eventhub_driver_messages.name
+
   authentication_type = "identityBased"
-
-
+ 
+ 
 }
-
+ 
 # ---------------------------------------------
+
 # Route: DeviceMessages("Raw") -> custom EH endpoint
+
 # ---------------------------------------------
+
 resource "azurerm_iothub_route" "telemetry_to_custom_eventhub" {
+
   resource_group_name = var.resource_group
+
   iothub_name         = data.azurerm_iothub.iothub.name
-  name                = "SqlIngestionToEvents2"
 
+  name                = "SqlIngestionToEvents"
+ 
   source         = "DeviceMessages"
-  condition      = "$body.MessageType = 'Raw'"
-  endpoint_names = [azurerm_iothub_endpoint_eventhub.iothub_endpoint_eventhub_messages.name]
-  enabled        = true
 
+  condition      = "$body.MessageType = 'Raw'"
+
+  endpoint_names = [azurerm_iothub_endpoint_eventhub.iothub_endpoint_eventhub_messages.name]
+
+  enabled        = true
+ 
   depends_on = [azurerm_iothub_endpoint_eventhub.iothub_endpoint_eventhub_messages]
+
 }
