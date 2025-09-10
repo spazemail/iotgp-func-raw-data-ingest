@@ -5,10 +5,8 @@
 # Prefer the *Event Hub* scope least-privilege:
 # -----------------------------
 resource "azurerm_role_assignment" "iothub_eventhub_sender" {
-  scope                = azurerm_eventhub.eventhub_driver_messages.id   # or data.azurerm_eventhub_namespace.eventhubs_namespace.id
+  scope                = azurerm_eventhub.eventhub_driver_messages.id
   role_definition_name = "Azure Event Hubs Data Sender"
-
-  # Use the IoT Hub's system-assigned identity
   principal_id         = data.azurerm_iothub.iothub.identity[0].principal_id
 }
 # ---------------------------------------------
@@ -30,6 +28,10 @@ resource "azurerm_iothub_endpoint_eventhub" "iothub_endpoint_eventhub_messages" 
   entity_path         = azurerm_eventhub.eventhub_driver_messages.name
 
   authentication_type = "identityBased"
+
+  depends_on = [
+    azurerm_role_assignment.iothub_eventhub_sender
+  ]
  
  
 }
